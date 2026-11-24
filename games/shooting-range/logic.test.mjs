@@ -5,6 +5,8 @@ import {
   NORMAL_R_MIN, NORMAL_R_MAX, GOLD_R_MIN, GOLD_R_MAX, BOMB_R,
   GOLD_POINTS, BOMB_PENALTY, GOLD_SWAY_HZ, TARGET_TTL_MS,
   SPAWN_COLS, SPAWN_ROWS, SPAWN_X0, SPAWN_X1, SPAWN_Y0, SPAWN_Y1,
+  balloonPoints, BALLOON_R, BALLOON_START_Y, BALLOON_FULL_Y, BALLOON_RISE,
+  BALLOON_POINTS_MIN, BALLOON_POINTS_MAX, BALLOON_MAX_ALIVE, BALLOON_FIRST_MS,
 } from './logic.js';
 import { mulberry32 } from '../alien-attack/logic.js';
 
@@ -220,4 +222,187 @@ test('shots after the buzzer do nothing', () => {
   const res = r.shoot(t.x, t.y, ROUND_MS + 200);
   assert.equal(res.hit, false);
   assert.equal(r.shots, 0, 'the trigger is dead after time');
+});
+
+// ── Two players ────────────────────────────────────────────────────────────
+
+test('2P: each player keeps their own score, shots and hits', () => {
+  const r = new Range({ rng: mulberry32(3), players: 2 });
+  r.start(0);
+  const a = spawnKind(r, 'normal');
+  const b = spawnKind(r, 'normal');
+  const resA = r.shoot(a.x, a.y, 10, 0);
+  const resB = r.shoot(b.x, b.y, 20, 1);
+  r.shoot(0.001, 0.001, 30, 1);                       // P2 whiffs
+  assert.equal(resA.player, 0);
+  assert.equal(resB.player, 1);
+  assert.equal(r.stats[0].score, resA.points);
+  assert.equal(r.stats[1].score, resB.points);
+  assert.deepEqual([r.stats[0].shots, r.stats[1].shots], [1, 2]);
+  assert.deepEqual([r.stats[0].hits, r.stats[1].hits], [1, 1]);
+  assert.equal(r.accuracyOf(1), 0.5);
+});
+
+test('2P: first shot takes the target — the other player gets nothing', () => {
+  const r = new Range({ rng: mulberry32(3), players: 2 });
+  r.start(0);
+  const t = spawnKind(r, 'normal');
+  assert.equal(r.shoot(t.x, t.y, 10, 1).hit, true);
+  assert.equal(r.shoot(t.x, t.y, 11, 0).hit, false, 'already gone');
+  assert.equal(r.stats[0].score, 0);
+  assert.ok(r.stats[1].score > 0);
+});
+
+test('2P: a bomb only costs the player who shot it, floored at zero', () => {
+  const r = new Range({ rng: mulberry32(3), players: 2 });
+  r.start(0);
+  const n = spawnKind(r, 'normal');
+  r.shoot(n.x, n.y, 5, 0);
+  const before = r.stats[0].score;
+  const bomb = spawnKind(r, 'bomb');
+  r.shoot(bomb.x, bomb.y, 10, 1);                     // P2 eats the bomb at 0
+  assert.equal(r.stats[1].score, 0, 'floored');
+  assert.equal(r.stats[1].bombs, 1);
+  assert.equal(r.stats[0].score, before, 'P1 untouched');
+  const bomb2 = spawnKind(r, 'bomb');
+  r.shoot(bomb2.x, bomb2.y, 20, 0);
+  assert.equal(r.stats[0].score, Math.max(0, before - BOMB_PENALTY));
+});
+
+test('2P: done event reports both players and the winner', () => {
+  const events = [];
+  const r = new Range({ onEvent: (e) => events.push(e), rng: mulberry32(5), players: 2 });
+  r.start(0);
+  const g = spawnKind(r, 'gold');
+  r.shoot(g.x, g.y, 100, 1);                          // P2 scores, P1 doesn't
+  for (let now = 0; now <= ROUND_MS + 100; now += 100) r.update(now);
+  const done = events.find((e) => e.type === 'done');
+  assert.equal(done.winner, 1);
+  assert.equal(done.players.length, 2);
+  assert.equal(done.players[1].score, GOLD_POINTS);
+  assert.equal(done.players[0].score, 0);
+});
+
+test('2P: equal scores are a tie (-1); a solo round has no winner', () => {
+  const r = new Range({ rng: mulberry32(1), players: 2 });
+  r.start(0);
+  assert.equal(r.winner, -1);
+  const solo = new Range({ rng: mulberry32(1) });
+  solo.start(0);
+  assert.equal(solo.winner, null);
+});
+
+test('2P: shots from a player index that is not in the round are ignored', () => {
+  const r = new Range({ rng: mulberry32(3) });        // solo round
+  r.start(0);
+  const t = spawnKind(r, 'normal');
+  assert.equal(r.shoot(t.x, t.y, 10, 1).hit, false);
+  assert.equal(r.targets.length, 1, 'target still standing');
+});
+
+test('2P: start(now, players) resizes the round and wipes old stats', () => {
+  const r = new Range({ rng: mulberry32(3) });
+  r.start(0);
+  const t = spawnKind(r, 'normal');
+  r.shoot(t.x, t.y, 5, 0);
+  r.start(100, 2);
+  assert.equal(r.playerCount, 2);
+  assert.deepEqual(r.stats.map((s) => s.score), [0, 0]);
+  assert.equal(r.balloons.length, 0);
+});
+
+// ── Balloons ───────────────────────────────────────────────────────────────
+
+test('balloons: payout rises with height, from MIN to MAX, in steps of 5', () => {
+  assert.equal(balloonPoints(BALLOON_START_Y), BALLOON_POINTS_MIN);
+  assert.equal(balloonPoints(BALLOON_FULL_Y), BALLOON_POINTS_MAX);
+  assert.equal(balloonPoints(-1), BALLOON_POINTS_MAX, 'clamped at the top');
+  assert.equal(balloonPoints(2), BALLOON_POINTS_MIN, 'clamped at the bottom');
+  let prev = 0;
+  for (let y = BALLOON_START_Y; y >= BALLOON_FULL_Y; y -= 0.01) {
+    const p = balloonPoints(y);
+    assert.ok(p >= prev, 'never pays less as it climbs');
+    assert.equal(p % 5, 0);
+    prev = p;
+  }
+  assert.ok(BALLOON_POINTS_MAX > GOLD_POINTS);
+});
+
+test('balloons: first one appears on schedule and rises steadily', () => {
+  const r = new Range({ rng: mulberry32(2), balloonRng: mulberry32(11) });
+  r.start(0);
+  r.update(BALLOON_FIRST_MS - 10);
+  assert.equal(r.balloons.length, 0);
+  r.update(BALLOON_FIRST_MS + 10);
+  assert.equal(r.balloons.length, 1);
+  const b = r.balloons[0];
+  const y0 = b.y;
+  r.update(BALLOON_FIRST_MS + 1010);
+  assert.ok(Math.abs((y0 - b.y) - BALLOON_RISE * 1.0) < 1e-6, 'rises BALLOON_RISE per second');
+});
+
+test('balloons: they escape off the top with no points, and never overfill', () => {
+  const events = [];
+  const r = new Range({
+    onEvent: (e) => events.push(e), rng: mulberry32(2), balloonRng: mulberry32(11),
+  });
+  r.start(0);
+  let maxAlive = 0;
+  for (let now = 0; now <= ROUND_MS; now += 50) {
+    r.update(now);
+    maxAlive = Math.max(maxAlive, r.balloons.length);
+    for (const b of r.balloons) assert.ok(b.y > 0, 'no balloon lingers past the top');
+    if (r.state === 'done') break;
+  }
+  assert.ok(maxAlive >= 1 && maxAlive <= BALLOON_MAX_ALIVE);
+  assert.ok(events.some((e) => e.type === 'expire' && e.target.kind === 'balloon'));
+  assert.equal(r.score, 0, 'an escaped balloon costs and pays nothing');
+});
+
+test('balloons: shooting one pays by height and counts toward balloon stats', () => {
+  const events = [];
+  const r = new Range({
+    onEvent: (e) => events.push(e), rng: mulberry32(2), balloonRng: mulberry32(11), players: 2,
+  });
+  r.start(0);
+  r.update(BALLOON_FIRST_MS + 10);
+  const b = r.balloons[0];
+  const low = balloonPoints(b.y);
+  const res = r.shoot(b.x, b.y, BALLOON_FIRST_MS + 20, 1);
+  assert.equal(res.hit, true);
+  assert.equal(res.kind, 'balloon');
+  assert.equal(res.points, low);
+  assert.equal(r.stats[1].balloons, 1);
+  assert.equal(r.stats[1].score, low);
+  assert.equal(r.balloons.length, 0);
+
+  // A later one, shot high up, pays more.
+  r.update(BALLOON_FIRST_MS + 8_000);
+  r.nextBalloonMs = 0;
+  r.update(BALLOON_FIRST_MS + 8_010);
+  const b2 = r.balloons[0];
+  b2.bornMs -= 6_000;                                  // age it into the upper sky
+  r.update(BALLOON_FIRST_MS + 8_020);
+  const high = r.shoot(b2.x, b2.y, BALLOON_FIRST_MS + 8_030, 0);
+  assert.ok(high.points > low, `higher pays more (${high.points} > ${low})`);
+  assert.ok(events.some((e) => e.type === 'hit' && e.kind === 'balloon' && e.player === 0));
+});
+
+test('balloons: hit area is a circle of BALLOON_R around the balloon body', () => {
+  const r = new Range({ rng: mulberry32(2), balloonRng: mulberry32(11) });
+  r.start(0);
+  r.update(BALLOON_FIRST_MS + 10);
+  const b = r.balloons[0];
+  assert.equal(r.shoot(b.x + BALLOON_R + 1e-3, b.y, BALLOON_FIRST_MS + 20).hit, false);
+  assert.equal(r.shoot(b.x + BALLOON_R - 1e-3, b.y, BALLOON_FIRST_MS + 30).hit, true);
+});
+
+test('balloons: do not count toward MAX_ALIVE or take grid cells', () => {
+  const r = new Range({ rng: mulberry32(2), balloonRng: mulberry32(11) });
+  r.start(0);
+  r.spawnBalloon(0);
+  r.spawnBalloon(0);
+  for (let i = 0; i < MAX_ALIVE + 3; i += 1) r.update(1000 + i * 600);
+  assert.ok(r.targets.length <= MAX_ALIVE);
+  assert.equal(r.targets.some((t) => t.kind === 'balloon'), false);
 });
