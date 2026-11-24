@@ -2,10 +2,13 @@
  * Shooting Range — gallery logic. No renderer, no DOM.
  *
  * One continuous 60-second gallery in a meadow: targets pop up, the
- * crosshair follows the pointer, A fires. Three target types:
- *   normal — the classic bullseye; smaller ones pay more (10..30)
- *   gold   — small and drifting on a sine sway; pays GOLD_POINTS
- *   bomb   — shooting it explodes and costs BOMB_PENALTY points
+ * crosshair follows the pointer, A fires. One or two players share the
+ * same targets — first shot to land takes the target. Target types:
+ *   normal  — the classic bullseye; smaller ones pay more (10..30)
+ *   gold    — small and drifting on a sine sway; pays GOLD_POINTS
+ *   bomb    — shooting it explodes and costs BOMB_PENALTY points
+ *   balloon — floats up from the bottom and escapes off the top; pays
+ *             BALLOON_POINTS_MIN..MAX, more the higher it has climbed
  *
  * Coordinates live in an abstract 1.6 × 1.0 field so the logic, the
  * renderer and the tests all agree on geometry.
@@ -39,39 +42,126 @@ export const MAX_ALIVE = 6;
 export const SPAWN_MS_START = 950;   // spawn interval at the start…
 export const SPAWN_MS_END = 500;     // …ramping down to this by the end
 
+// Balloons: they ride their own clock and never take a grid cell, so they
+// don't count toward MAX_ALIVE. Higher = more points, but they escape.
+export const BALLOON_R = 0.065;
+export const BALLOON_START_Y = 1.05;      // centre starts just below the field
+export const BALLOON_FULL_Y = 0.12;       // at or above this it pays the max
+export const BALLOON_ESCAPE_Y = 0.0;      // centre passes the top → it's gone
+export const BALLOON_RISE = 0.13;         // field heights per second
+export const BALLOON_SWAY_MAX = 0.045;
+export const BALLOON_SWAY_HZ = 0.3;
+export const BALLOON_POINTS_MIN = 40;
+export const BALLOON_POINTS_MAX = 100;
+export const BALLOON_MAX_ALIVE = 2;
+export const BALLOON_FIRST_MS = 2_500;
+export const BALLOON_MS_MIN = 3_800;
+export const BALLOON_MS_MAX = 6_200;
+export const BALLOON_VARIANTS = 4;        // colour choices for the renderer
+export const MAX_PLAYERS = 2;
+
 /** Points for a NORMAL target of radius r: 30 smallest, 10 biggest. */
 export function pointsFor(r) {
   return Math.round(10 + 20 * ((NORMAL_R_MAX - r) / (NORMAL_R_MAX - NORMAL_R_MIN)));
 }
 
+/** Balloon payout by height: MIN at the bottom, MAX near the top, in 5s. */
+export function balloonPoints(y) {
+  const k = Math.max(0, Math.min(1,
+    (BALLOON_START_Y - y) / (BALLOON_START_Y - BALLOON_FULL_Y)));
+  const raw = BALLOON_POINTS_MIN + (BALLOON_POINTS_MAX - BALLOON_POINTS_MIN) * k;
+  return Math.round(raw / 5) * 5;
+}
+
+const newStats = () => ({ score: 0, shots: 0, hits: 0, bombs: 0, balloons: 0 });
+
 export class Range {
-  constructor({ onEvent = () => {}, rng = Math.random } = {}) {
+  /**
+   * `players` is how many shooters a round has (1 or 2). The single-player
+   * shorthands (score, shots, hits, bombs, accuracy) read player 0, so a
+   * solo round behaves exactly as it always did.
+   */
+  constructor({
+    onEvent = () => {}, rng = Math.random, balloonRng = Math.random, players = 1,
+  } = {}) {
     this.onEvent = onEvent;
     this.rng = rng;
+    this.balloonRng = balloonRng;     // separate stream: balloons never shift target rolls
     this.state = 'ready';             // ready | running | done
+    this.playerCount = Math.max(1, Math.min(MAX_PLAYERS, players));
+    this.stats = Array.from({ length: this.playerCount }, newStats);
     this.targets = [];
-    this.score = 0;
-    this.shots = 0;
-    this.hits = 0;
-    this.bombs = 0;
+    this.balloons = [];
     this.startMs = 0;
     this.nextSpawnMs = 0;
+    this.nextBalloonMs = 0;
     this.nextId = 1;
   }
 
-  start(now) {
+  start(now, players = this.playerCount) {
     this.state = 'running';
+    this.playerCount = Math.max(1, Math.min(MAX_PLAYERS, players));
+    this.stats = Array.from({ length: this.playerCount }, newStats);
     this.targets = [];
-    this.score = 0;
-    this.shots = 0;
-    this.hits = 0;
-    this.bombs = 0;
+    this.balloons = [];
     this.startMs = now;
     this.nextSpawnMs = now + 400;     // a beat of quiet, then the first pop
+    this.nextBalloonMs = now + BALLOON_FIRST_MS;
+  }
+
+  // Player-0 shorthands (the whole game when playerCount is 1).
+  get score() { return this.stats[0].score; }
+  get shots() { return this.stats[0].shots; }
+  get hits() { return this.stats[0].hits; }
+  get bombs() { return this.stats[0].bombs; }
+
+  accuracyOf(player) {
+    const s = this.stats[player];
+    return s && s.shots ? s.hits / s.shots : 0;
   }
 
   get accuracy() {
-    return this.shots ? this.hits / this.shots : 0;
+    return this.accuracyOf(0);
+  }
+
+  /** Index of the top scorer, -1 for a tie, null in a solo round. */
+  get winner() {
+    if (this.playerCount < 2) return null;
+    const [a, b] = [this.stats[0].score, this.stats[1].score];
+    return a === b ? -1 : a > b ? 0 : 1;
+  }
+
+  spawnBalloon(now) {
+    const rng = this.balloonRng;
+    // Keep it clear of a balloon already in the air so they don't stack.
+    let x0 = 0;
+    for (let tries = 0; tries < 6; tries += 1) {
+      x0 = 0.15 + rng() * (FIELD_W - 0.3);
+      if (this.balloons.every((b) => Math.abs(b.x0 - x0) > 0.35)) break;
+    }
+    const b = {
+      id: this.nextId++,
+      kind: 'balloon',
+      variant: Math.floor(rng() * BALLOON_VARIANTS) % BALLOON_VARIANTS,
+      x0,
+      x: x0,
+      y: BALLOON_START_Y,
+      r: BALLOON_R,
+      swayAmp: 0.015 + rng() * (BALLOON_SWAY_MAX - 0.015),
+      swayHz: BALLOON_SWAY_HZ * (0.8 + rng() * 0.4),
+      phase: rng() * Math.PI * 2,
+      bornMs: now,
+    };
+    this.balloons.push(b);
+    this.onEvent({ type: 'spawn', target: b });
+    return b;
+  }
+
+  /** Balloons rise steadily and sway; position is a pure function of age. */
+  placeBalloon(b, now) {
+    const age = (now - b.bornMs) / 1000;
+    b.y = BALLOON_START_Y - BALLOON_RISE * age;
+    b.x = b.x0 + Math.sin(b.phase + age * b.swayHz * Math.PI * 2) * b.swayAmp;
   }
 
   spawn(now) {
@@ -129,32 +219,44 @@ export class Range {
     return t.x0 + Math.sin(t.phase + age * GOLD_SWAY_HZ * Math.PI * 2) * t.swayAmp;
   }
 
-  /** Fire at field coordinates. Returns { hit, kind?, points?, target? }. */
-  shoot(x, y, now) {
-    if (this.state !== 'running') return { hit: false };
-    this.shots += 1;
+  /**
+   * Fire at field coordinates as `player` (0 or 1). Whoever's shot lands
+   * first takes the target — it's gone for the other player.
+   * Returns { hit, kind?, points?, target?, player }.
+   */
+  shoot(x, y, now, player = 0) {
+    const st = this.stats[player];
+    if (this.state !== 'running' || !st) return { hit: false, player };
+    st.shots += 1;
     let best = null;
     let bestD = Infinity;
-    for (const t of this.targets) {
+    for (const t of this.targets.concat(this.balloons)) {
       const d = Math.hypot(x - t.x, y - t.y);
       if (d <= t.r && d < bestD) { best = t; bestD = d; }
     }
     if (!best) {
-      this.onEvent({ type: 'miss', x, y });
-      return { hit: false };
+      this.onEvent({ type: 'miss', x, y, player });
+      return { hit: false, player };
     }
     this.targets = this.targets.filter((t) => t !== best);
+    this.balloons = this.balloons.filter((t) => t !== best);
     if (best.kind === 'bomb') {
-      this.bombs += 1;
-      this.score = Math.max(0, this.score - BOMB_PENALTY);
-      this.onEvent({ type: 'bombHit', penalty: BOMB_PENALTY, target: best, score: this.score });
-      return { hit: true, kind: 'bomb', points: -BOMB_PENALTY, target: best };
+      st.bombs += 1;
+      st.score = Math.max(0, st.score - BOMB_PENALTY);
+      this.onEvent({
+        type: 'bombHit', penalty: BOMB_PENALTY, target: best, score: st.score, player,
+      });
+      return { hit: true, kind: 'bomb', points: -BOMB_PENALTY, target: best, player };
     }
-    this.hits += 1;
-    const points = best.kind === 'gold' ? GOLD_POINTS : pointsFor(best.r);
-    this.score += points;
-    this.onEvent({ type: 'hit', kind: best.kind, points, target: best, score: this.score });
-    return { hit: true, kind: best.kind, points, target: best };
+    st.hits += 1;
+    let points;
+    if (best.kind === 'balloon') { st.balloons += 1; points = balloonPoints(best.y); }
+    else points = best.kind === 'gold' ? GOLD_POINTS : pointsFor(best.r);
+    st.score += points;
+    this.onEvent({
+      type: 'hit', kind: best.kind, points, target: best, score: st.score, player,
+    });
+    return { hit: true, kind: best.kind, points, target: best, player };
   }
 
   update(now) {
@@ -169,7 +271,22 @@ export class Range {
       return false;
     });
 
+    // Balloons: climb, sway, and slip away off the top.
+    this.balloons = this.balloons.filter((b) => {
+      this.placeBalloon(b, now);
+      if (b.y > BALLOON_ESCAPE_Y) return true;
+      this.onEvent({ type: 'expire', target: b });
+      return false;
+    });
+
     const elapsed = now - this.startMs;
+    if (now >= this.nextBalloonMs && this.balloons.length < BALLOON_MAX_ALIVE
+        && elapsed < ROUND_MS - 1_500) {
+      this.spawnBalloon(now);
+      this.nextBalloonMs = now + BALLOON_MS_MIN
+        + this.balloonRng() * (BALLOON_MS_MAX - BALLOON_MS_MIN);
+    }
+
     const ramp = Math.min(1, elapsed / ROUND_MS);
     const interval = SPAWN_MS_START + (SPAWN_MS_END - SPAWN_MS_START) * ramp;
     if (now >= this.nextSpawnMs && this.targets.length < MAX_ALIVE
@@ -182,11 +299,15 @@ export class Range {
       this.state = 'done';
       this.onEvent({
         type: 'done',
+        // Player-0 fields, as before, so a solo round reads the same…
         score: this.score,
         shots: this.shots,
         hits: this.hits,
         bombs: this.bombs,
         accuracy: this.accuracy,
+        // …plus everyone, and who won.
+        players: this.stats.map((st, i) => ({ ...st, accuracy: this.accuracyOf(i) })),
+        winner: this.winner,
       });
     }
   }
