@@ -2,16 +2,18 @@ import { consumeLaunchSplash } from '../../core/splash.js';
 
 // Carry the menu's launch banner across the navigation, then fade it out.
 consumeLaunchSplash();
-import { createChannel } from '../../core/channel.js';
+import { createPlayersChannel } from './input.js';
 import {
-  Range, FIELD_W, FIELD_H, ROUND_MS, GOLD_POINTS, BOMB_PENALTY,
+  Range, FIELD_W, FIELD_H, ROUND_MS, GOLD_POINTS, BOMB_PENALTY, MAX_PLAYERS,
+  balloonPoints,
 } from './logic.js';
 
 /**
  * Shooting Range — renderer. A sunny Wii Play meadow filling the whole
  * screen: blue sky, drifting clouds, rolling grass, targets popping over
- * the field. The crosshair trails sparkle dust; A fires. All rules live in
- * logic.js; this file only draws.
+ * the field. The crosshair trails sparkle dust; A fires. Two players share
+ * the field, each with their own phone, crosshair and score — first shot
+ * takes the target. All rules live in logic.js; this file only draws.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -19,7 +21,17 @@ const canvas = $('game');
 const ctx = canvas.getContext('2d');
 
 const range = new Range({ onEvent: handleEvent });
-let started = false;
+
+// Per-player look. P1 keeps the original red reticle.
+const PLAYERS = [
+  { name: 'P1', color: '#e2483d', pop: '#ff8a80', trail: '#ffd2cc' },
+  { name: 'P2', color: '#2f7de1', pop: '#8cc2ff', trail: '#bfe6ff' },
+];
+const REMATCH_LOCK_MS = 1200;       // ignore trigger-mashing right after the buzzer
+let phase = 'lobby';                // lobby | running | results
+let ready = [false, false];         // who has pressed A in the lobby
+let connected = [false, false];     // which phones are paired
+let doneAt = 0;
 
 // Screen mapping: the FIELD (1.6×1) COVERS the window — full bleed, the
 // overflow cropped evenly, so the meadow always fills every pixel.
@@ -205,11 +217,10 @@ function drawGrassRow(row, now) {
 const popups = [];      // { x, y, text, color, age }
 const stars = [];       // { x, y, vx, vy, age, life, size, color }
 const booms = [];       // { x, y, age }
-const trail = [];       // recent crosshair points for the blade ribbon
+const trails = [[], []];   // per player: recent crosshair points for the ribbon
 let shake = 0;
-let flashAge = 1;
-let aim = { x: 0.5, y: 0.5 };
-let lastAim = { x: 0.5, y: 0.5 };
+const flashAges = [1, 1];
+const aims = [{ x: 0.5, y: 0.5 }, { x: 0.5, y: 0.5 }];
 
 function starBurst(x, y, color, n = 8, speed = 0.3) {
   for (let i = 0; i < n; i += 1) {
@@ -240,15 +251,48 @@ function drawStar(x, y, r, color, alpha) {
 }
 
 // ── Wiring ─────────────────────────────────────────────────────────────────
-const channel = createChannel({
-  onA: () => {
-    if (!started || range.state === 'done') { startRound(); return; }
-    fire();
+const channel = createPlayersChannel({
+  players: MAX_PLAYERS,
+  onA: (slot) => {
+    if (phase === 'running') { fire(slot); return; }
+    if (phase === 'results') {
+      if (performance.now() - doneAt < REMATCH_LOCK_MS) return;
+      phase = 'lobby';                       // rematch: everyone readies up again
+      ready = [false, false];
+    }
+    ready[slot] = true;
+    maybeStart();
+  },
+  onSolo: () => {
+    if (phase === 'running') return;
+    if (phase === 'results') {
+      if (performance.now() - doneAt < REMATCH_LOCK_MS) return;
+      phase = 'lobby';
+      ready = [false, false];
+    }
+    ready[0] = true;
+    startRound(ready[1] ? 2 : 1);            // Space = go now with whoever is in
+  },
+  onPresence: (c) => {
+    connected = c;
+    syncLink();
+    if (phase === 'lobby') renderLobby();
   },
 });
 
 // Dev console hook: inspect targets and the field mapping from the console.
-window.__debug = { range, view: () => view, aim: () => aim };
+window.__debug = { range, view: () => view, aims: () => aims, channel: () => channel };
+
+function syncLink() {
+  const dot = $('dot');
+  if (dot) dot.classList.toggle('on', connected.some(Boolean));
+  const label = $('link-t');
+  if (label) {
+    label.textContent = connected.some(Boolean)
+      ? `P1 ${connected[0] ? '●' : '○'}  P2 ${connected[1] ? '●' : '○'}`
+      : 'no remote connected';
+  }
+}
 
 // ── Sound design ───────────────────────────────────────────────────────────
 // Every cue can be replaced by dropping a file at audio/<name>.{mp3,wav,ogg}.
@@ -281,6 +325,13 @@ audio.register('sr-bomb', (a) => {
   a.noise({ dur: 0.15, gain: 0.2, type: 'bandpass', freq: 1600, q: 2, delay: 0.05 });
 });
 
+// A balloon bursting: a rubbery snap with a quick falling blip.
+audio.register('sr-pop', (a) => {
+  a.noise({ dur: 0.05, gain: 0.34, type: 'highpass', freq: 3200 });
+  a.tone({ freq: 760, slideTo: 180, dur: 0.09, type: 'sine', gain: 0.24, attack: 0.001 });
+  a.tone({ freq: 1500, slideTo: 900, dur: 0.05, type: 'triangle', gain: 0.1, delay: 0.015 });
+});
+
 // A clean whiff for a missed shot.
 audio.register('sr-miss', (a) => {
   a.noise({ dur: 0.08, gain: 0.08, type: 'bandpass', freq: 700, q: 1 });
@@ -292,36 +343,104 @@ audio.register('sr-end', (a) => {
   a.tone({ freq: 880, dur: 0.34, type: 'square', gain: 0.12, delay: 0.2 });
 });
 
-function startRound() {
-  started = true;
-  range.start(performance.now());
+/** Everyone who is connected has to be ready; with nobody paired (desk test) the first click starts. */
+function maybeStart() {
+  const waitingOn = [0, 1].filter((i) => connected[i] && !ready[i]);
+  if ((ready[0] || ready[1]) && !waitingOn.length) startRound(ready[1] ? 2 : 1);
+  else renderLobby();
+}
+
+function startRound(players) {
+  phase = 'running';
+  ready = [false, false];
+  range.start(performance.now(), players);
   popups.length = 0;
   stars.length = 0;
   booms.length = 0;
+  trails.forEach((t) => { t.length = 0; });
+  $('card2').style.display = players > 1 ? '' : 'none';
+  $('score').textContent = '0';
+  $('score2').textContent = '0';
   $('overlay').classList.add('hide');
 }
 
-function fire() {
-  if (range.state !== 'running') return;
-  if (!channel.pointer.live && channel.mouse.active) {
-    aim = { x: channel.mouse.x, y: channel.mouse.y };
+function fire(slot) {
+  if (range.state !== 'running' || slot >= range.playerCount) return;
+  if (slot === 0 && !channel.pointers[0].live && channel.mouse.active) {
+    aims[0] = { x: channel.mouse.x, y: channel.mouse.y };
   }
-  const p = toField(aim.x, aim.y);
-  flashAge = 0;
+  const p = toField(aims[slot].x, aims[slot].y);
+  flashAges[slot] = 0;
   audio.play('sr-shot');
-  channel.feedback({ type: 'slice', combo: 1 });
-  range.shoot(p.x, p.y, performance.now());
+  channel.feedback(slot, { type: 'slice', combo: 1 });
+  range.shoot(p.x, p.y, performance.now(), slot);
+}
+
+// ── Lobby + results panels ─────────────────────────────────────────────────
+function slotLine(i) {
+  const name = PLAYERS[i].name;
+  const cls = `slot p${i + 1}`;
+  if (ready[i]) return `<span class="${cls} ready">${name} ✓ ready</span>`;
+  if (connected[i]) return `<span class="${cls}">${name} · press <strong>A</strong></span>`;
+  return `<span class="${cls} off">${name} · no phone yet</span>`;
+}
+
+function renderLobby() {
+  $('panel').innerHTML = `<h1>🎯 <em>Shooting Range</em></h1>
+    <p>Two players, one meadow, sixty seconds. The first shot to land takes the
+       target. Gold pays big, balloons pay more the higher they float — but
+       they escape off the top — and bombs cost you.</p>
+    <div class="slots">${slotLine(0)}${slotLine(1)}</div>
+    <div class="cta"><strong>A</strong> on each phone to join · <strong>Space</strong> to start now ·
+      <strong>B</strong> menu</div>`;
+  $('overlay').classList.remove('hide');
+}
+
+function playerColumn(i, st, won) {
+  const pct = Math.round(st.accuracy * 100);
+  return `<div class="pcol p${i + 1}${won ? ' won' : ''}">
+    <div class="pname">${PLAYERS[i].name}${won ? ' 🏆' : ''}</div>
+    <div class="pscore">${st.score}</div>
+    <div class="pline">${st.hits}/${st.shots} hits · ${pct}%</div>
+    <div class="pline">🎈 ${st.balloons} · 💣 ${st.bombs}</div>
+  </div>`;
+}
+
+function renderResults(e) {
+  let body;
+  if (range.playerCount < 2) {
+    const pct = Math.round(e.accuracy * 100);
+    body = `<h1>🎯 <em>Time!</em></h1>
+      <div>
+        <span class="stat"><b>${e.score}</b><span>score</span></span>
+        <span class="stat"><b>${e.hits}/${e.shots}</b><span>hits</span></span>
+        <span class="stat"><b>${pct}%</b><span>accuracy</span></span>
+        <span class="stat"><b>${e.players[0].balloons}</b><span>balloons</span></span>
+        <span class="stat"><b>${e.bombs}</b><span>bombs hit</span></span>
+      </div>`;
+  } else {
+    const title = e.winner === -1
+      ? '🤝 <em>Tie!</em>' : `🏆 <em>${PLAYERS[e.winner].name} wins!</em>`;
+    body = `<h1>${title}</h1>
+      <div class="pcols">${e.players.map((st, i) => playerColumn(i, st, e.winner === i)).join('')}</div>`;
+  }
+  $('panel').innerHTML = `${body}
+    <div class="cta"><strong>A</strong> rematch · <strong>B</strong> menu</div>`;
+  $('overlay').classList.remove('hide');
 }
 
 function handleEvent(e) {
+  const who = PLAYERS[e.player] || PLAYERS[0];
   if (e.type === 'hit') {
     const gold = e.kind === 'gold';
-    starBurst(e.target.x, e.target.y, gold ? '#ffd75e' : '#ffffff', gold ? 12 : 8);
+    const balloon = e.kind === 'balloon';
+    const burst = balloon ? BALLOON_COLORS[e.target.variant].base : gold ? '#ffd75e' : '#ffffff';
+    starBurst(e.target.x, e.target.y, burst, balloon ? 14 : gold ? 12 : 8);
     popups.push({
       x: e.target.x, y: e.target.y - e.target.r, text: `+${e.points}`,
-      color: gold ? '#ffd75e' : '#ffffff', age: 0,
+      color: range.playerCount > 1 ? who.pop : gold ? '#ffd75e' : '#ffffff', age: 0,
     });
-    audio.play(gold ? 'sr-gold' : 'sr-break');
+    audio.play(balloon ? 'sr-pop' : gold ? 'sr-gold' : 'sr-break');
   } else if (e.type === 'bombHit') {
     booms.push({ x: e.target.x, y: e.target.y, age: 0 });
     popups.push({
@@ -330,23 +449,21 @@ function handleEvent(e) {
     });
     shake = 1;
     audio.play('sr-bomb');
-    channel.feedback({ type: 'bomb' });
+    channel.feedback(e.player, { type: 'bomb' });
   } else if (e.type === 'miss') {
     starBurst(e.x, e.y, '#dfe9f2', 3, 0.12);
     audio.play('sr-miss');
   } else if (e.type === 'done') {
-    const pct = Math.round(e.accuracy * 100);
-    $('panel').innerHTML = `<h1>🎯 <em>Time!</em></h1>
-      <div>
-        <span class="stat"><b>${e.score}</b><span>score</span></span>
-        <span class="stat"><b>${e.hits}/${e.shots}</b><span>hits</span></span>
-        <span class="stat"><b>${pct}%</b><span>accuracy</span></span>
-        <span class="stat"><b>${e.bombs}</b><span>bombs hit</span></span>
-      </div>
-      <div class="cta"><strong>A</strong> shoot again · <strong>B</strong> menu</div>`;
-    $('overlay').classList.remove('hide');
+    phase = 'results';
+    doneAt = performance.now();
+    $('clock').textContent = '0.0s';
+    renderResults(e);
     audio.play('sr-end');
-    channel.feedback({ type: 'slice', combo: 3 });
+    // Winners (or everyone, on a tie / solo) get the big buzz; the loser a small one.
+    for (let i = 0; i < range.playerCount; i += 1) {
+      const big = e.winner === null || e.winner === -1 || e.winner === i;
+      channel.feedback(i, { type: 'slice', combo: big ? 3 : 1 });
+    }
   }
 }
 
@@ -405,13 +522,82 @@ function drawTarget(t, now) {
   }
 }
 
-function drawCrosshair(now) {
-  const x = aim.x * view.w;
-  const y = aim.y * view.h;
-  const r = 0.03 * view.s * (flashAge < 0.08 ? 1.25 : 1);
+const BALLOON_COLORS = [
+  { base: '#e2483d', hi: '#ff9b90', dark: '#a82a22' },
+  { base: '#f2b53a', hi: '#ffe49a', dark: '#b8821a' },
+  { base: '#3ab36a', hi: '#a4ecbd', dark: '#1f7a45' },
+  { base: '#8a5ad8', hi: '#cdb4ff', dark: '#5b34a0' },
+];
 
-  // White underlay for contrast, then the red reticle on top.
-  for (const [color, wl] of [['rgba(255,255,255,0.9)', 5], ['#e2483d', 2.5]]) {
+/** A glossy balloon with a knot, a wavy string, and what it's worth right now. */
+function drawBalloon(b, now) {
+  const c = BALLOON_COLORS[b.variant];
+  const x = fx(b.x);
+  const y = fy(b.y);
+  const r = b.r * view.s;
+  const bob = Math.sin(now / 320 + b.phase);
+
+  // String first, so the body sits on top of it.
+  ctx.strokeStyle = 'rgba(40,55,35,0.55)';
+  ctx.lineWidth = Math.max(1.5, r * 0.05);
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  const ky = y + r * 1.18;
+  ctx.moveTo(x, ky);
+  ctx.bezierCurveTo(x - r * 0.35 * bob, ky + r * 0.8, x + r * 0.35 * bob, ky + r * 1.5,
+    x - r * 0.15 * bob, ky + r * 2.4);
+  ctx.stroke();
+
+  // Knot.
+  ctx.fillStyle = c.dark;
+  ctx.beginPath();
+  ctx.moveTo(x, y + r * 1.04);
+  ctx.lineTo(x - r * 0.16, y + r * 1.26);
+  ctx.lineTo(x + r * 0.16, y + r * 1.26);
+  ctx.closePath();
+  ctx.fill();
+
+  // Body: slightly taller than the hit circle, which covers its middle.
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.45, r * 0.1, x, y, r * 1.25);
+  g.addColorStop(0, c.hi);
+  g.addColorStop(0.45, c.base);
+  g.addColorStop(1, c.dark);
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.ellipse(x, y - r * 0.06, r * 1.0, r * 1.16, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Shine.
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath();
+  ctx.ellipse(x - r * 0.4, y - r * 0.5, r * 0.16, r * 0.3, -0.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Current payout: it grows as the balloon climbs.
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `800 ${Math.round(r * 0.62)}px -apple-system, sans-serif`;
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = 'rgba(30,20,20,0.55)';
+  const label = String(balloonPoints(b.y));
+  ctx.strokeText(label, x, y + r * 0.02);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(label, x, y + r * 0.02);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawCrosshair(slot, now) {
+  const x = aims[slot].x * view.w;
+  const y = aims[slot].y * view.h;
+  const flashAge = flashAges[slot];
+  const r = 0.03 * view.s * (flashAge < 0.08 ? 1.25 : 1);
+  const tint = PLAYERS[slot].color;
+
+  // White underlay for contrast, then the player's reticle on top.
+  for (const [color, wl] of [['rgba(255,255,255,0.9)', 5], [tint, 2.5]]) {
     ctx.strokeStyle = color;
     ctx.lineWidth = wl;
     ctx.lineCap = 'round';
@@ -427,10 +613,20 @@ function drawCrosshair(now) {
     }
     ctx.stroke();
   }
-  ctx.fillStyle = '#e2483d';
+  ctx.fillStyle = tint;
   ctx.beginPath();
   ctx.arc(x, y, 2.2, 0, Math.PI * 2);
   ctx.fill();
+  if (twoUp()) {
+    // A small tag so each player can find their own reticle.
+    ctx.textAlign = 'left';
+    ctx.font = `800 ${Math.round(0.028 * view.s)}px -apple-system, sans-serif`;
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.strokeText(PLAYERS[slot].name, x + r * 1.3, y - r * 1.15);
+    ctx.fillStyle = tint;
+    ctx.fillText(PLAYERS[slot].name, x + r * 1.3, y - r * 1.15);
+  }
   if (flashAge < 0.08) {
     ctx.fillStyle = `rgba(255, 240, 190, ${0.5 * (1 - flashAge / 0.08)})`;
     ctx.beginPath();
@@ -439,6 +635,12 @@ function drawCrosshair(now) {
   }
   void now;
 }
+
+// Whose crosshair is on screen: the round's players, or whoever is paired in the lobby.
+const shown = (i) => (phase === 'running'
+  ? i < range.playerCount
+  : i === 0 || connected[i] || channel.pointers[i].live);
+const twoUp = () => shown(0) && shown(1);
 
 // ── Loop ───────────────────────────────────────────────────────────────────
 let last = performance.now();
@@ -449,17 +651,23 @@ function frame(now) {
   last = now;
   if (dt <= 0) return;
 
-  const p = channel.poll(now);
-  if (p) aim = p;
-  flashAge += dt;
+  const polled = channel.poll(now);
+  for (let i = 0; i < MAX_PLAYERS; i += 1) {
+    if (polled[i]) aims[i] = polled[i];
+    flashAges[i] += dt;
+  }
   range.update(now);
 
-  // The blade ribbon: remember where the crosshair has just been.
-  const f = toField(aim.x, aim.y);
-  trail.push({ x: f.x, y: f.y, ms: now });
-  while (trail.length && now - trail[0].ms > 220) trail.shift();
-  if (trail.length > 26) trail.shift();
-  lastAim = { x: aim.x, y: aim.y };
+  // The blade ribbon: remember where each crosshair has just been.
+  for (let i = 0; i < MAX_PLAYERS; i += 1) {
+    const trail = trails[i];
+    if (shown(i)) {
+      const f = toField(aims[i].x, aims[i].y);
+      trail.push({ x: f.x, y: f.y, ms: now });
+    }
+    while (trail.length && now - trail[0].ms > 220) trail.shift();
+    if (trail.length > 26) trail.shift();
+  }
 
   // Screen shake from bombs.
   shake = Math.max(0, shake - dt * 2.5);
@@ -479,6 +687,7 @@ function frame(now) {
   for (const row of GRASS_ROWS) drawGrassRow(row, now);
 
   for (const t of range.targets) drawTarget(t, now);
+  for (const b of range.balloons) drawBalloon(b, now);
 
   // Bomb explosions: expanding rings of fire and smoke.
   for (let i = booms.length - 1; i >= 0; i -= 1) {
@@ -511,8 +720,12 @@ function frame(now) {
 
   // The blade ribbon, drawn like Fruit Ninja's: a tapered swoosh — a wide
   // soft blue underlay with a bright white core, fading with age.
-  if (trail.length > 1) {
-    for (const [color, base, alphaK] of [['#bfe6ff', 0.016, 0.4], ['#ffffff', 0.009, 0.85]]) {
+  for (let pi = 0; pi < MAX_PLAYERS; pi += 1) {
+    const trail = trails[pi];
+    if (trail.length < 2) continue;
+    for (const [color, base, alphaK] of [
+      [PLAYERS[pi].trail, 0.016, 0.4], ['#ffffff', 0.009, 0.85],
+    ]) {
       for (let i = 1; i < trail.length; i += 1) {
         const a = trail[i - 1];
         const b = trail[i];
@@ -563,25 +776,30 @@ function frame(now) {
 
   drawGrassRow(GRASS_FRINGE, now);
 
-  drawCrosshair(now);
+  for (let i = 0; i < MAX_PLAYERS; i += 1) if (shown(i)) drawCrosshair(i, now);
   ctx.restore();
 
   if (range.state === 'running') {
     const leftS = Math.max(0, (ROUND_MS - (now - range.startMs)) / 1000);
-    $('score').textContent = range.score;
-    $('meta').textContent = `${leftS.toFixed(1)}s · ${range.hits}/${range.shots} hits`;
+    $('clock').textContent = `${leftS.toFixed(1)}s`;
+    range.stats.forEach((st, i) => {
+      $(i ? 'score2' : 'score').textContent = st.score;
+      $(i ? 'meta2' : 'meta').textContent = `${st.hits}/${st.shots} hits`;
+    });
   }
 
   const dbg = $('debug');
   if (dbg && dbg.classList.contains('on')) {
-    dbg.textContent = `state ${range.state}\ntargets ${range.targets.length}\n`
+    dbg.textContent = `state ${range.state} · phase ${phase}\n`
+      + `targets ${range.targets.length} · balloons ${range.balloons.length}\n`
+      + `phones ${connected.map((c) => (c ? 'on' : 'off')).join('/')}\n`
       + `gold ${GOLD_POINTS} · bomb -${BOMB_PENALTY}\nshake ${shake.toFixed(2)}`;
   }
 }
 layout();
 requestAnimationFrame(frame);
 
-// Launching from the menu goes straight into the round — no instruction
-// screen; the first target holds off a moment while the splash fades.
-startRound();
-range.nextSpawnMs = performance.now() + 1600;
+// Launching from the menu lands in the lobby: each player presses A on their
+// phone to join (Space or a click starts a solo round straight away).
+syncLink();
+renderLobby();
