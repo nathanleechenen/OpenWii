@@ -144,6 +144,36 @@ patch('games/mario-kart/game.js', [
   ["()=>location.href='/',100", "()=>(window.openwiiExit?window.openwiiExit():location.href='/'),100"],
 ]);
 
+// Mario Kart multiplayer (stage 1): extra phones drive their own karts.
+// The logic lives in games/mario-kart/multiplayer.js; these are only the hooks.
+patch('games/mario-kart/game.js', [
+  ['import { WheelInput } from "./input.js";',
+    'import { WheelInput } from "./input.js";\nimport { MultiRace, RemotePlayers } from "./multiplayer.js";'],
+  ['keys = new Set();', 'keys = new Set(),\n  remotes = new RemotePlayers();'],
+  ['race = new Race({\n    character: selected,', 'race = new MultiRace({\n    character: selected,'],
+  ['onOrientation: (sample, slot) => {\n    if (slot !== 0) return;',
+    'onOrientation: (sample, slot) => {\n    if (slot !== 0) { remotes.sample(sample, slot, performance.now(), race?.state); return; }'],
+  ['onCommand: (cmd, slot) => {\n    if (slot !== 0) return;',
+    'onCommand: (cmd, slot) => {\n    if (slot !== 0) { remotes.command(cmd, slot, performance.now()); return; }'],
+  ['onPresence: (p) => {', 'onPresence: (p) => {\n    remotes.presence(p);'],
+  ['? "PHONE CONNECTED · P1"', '? remotes.label(p)'],
+  ['function sendProfile() {\n  link.feedback({ type: "controller-profile", profile: "wheel", slot: 0 });',
+    'function sendProfile() {\n  link.feedback({ type: "controller-profile", profile: "wheel", slot: 0 });\n'
+    + '  for (const s of remotes.slots()) link.feedback({ type: "controller-profile", profile: "wheel", slot: s });'],
+  ["if(e.racer===0)link.feedback({type:'rumble',pattern:[35],slot:0});",
+    "if(e.racer===0)link.feedback({type:'rumble',pattern:[35],slot:0});"
+    + "else if(remotes.has(e.racer))link.feedback({type:'rumble',pattern:[35],slot:e.racer});"],
+  ['link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: 0 });',
+    'link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: 0 });\n'
+    + '    if (e.racer > 0 && remotes.has(e.racer)) link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: e.racer });'],
+  ['wheel.reset();\n  captureUntil = performance.now() + 3000;\n  race.start();',
+    'wheel.reset();\n  remotes.reset(performance.now());\n  captureUntil = performance.now() + 3000;\n  race.start();'],
+  ['if (!(usingPhone && race.state === "countdown" && !wheel.armed))\n      race.update(dt, input);',
+    'remotes.apply(race);\n    if (!(usingPhone && race.state === "countdown" && !(wheel.armed && remotes.allArmed())))\n      race.update(dt, input, remotes.read(now));'],
+  ["const waiting=usingPhone && race.state==='countdown' && !wheel.armed;",
+    "const waiting=usingPhone && race.state==='countdown' && !(wheel.armed && remotes.allArmed());"],
+]);
+
 // ── Report ──────────────────────────────────────────────────────────────────
 console.log(`OpenWii static build OK: ${fileCount} files, ${games.length} games → ${path.relative(process.cwd(), DIST) || DIST}`);
 console.log(`Games: ${games.map((g) => g.slug).join(', ')}`);
