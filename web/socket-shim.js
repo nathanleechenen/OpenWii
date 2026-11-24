@@ -530,6 +530,10 @@
 
     emit(ev, data) {
       if (!this.connected || !this.conn) return this;
+      // Orientation and motion are "latest sample wins": if the link is backed up,
+      // drop the stale sample instead of queueing it (queued samples = growing lag).
+      if ((ev === 'orientation' || ev === 'motion') && this.conn.dataChannel
+        && this.conn.dataChannel.bufferedAmount > 8192) return this;
       try { this.conn.send([ev, data]); } catch { /* the heartbeat will notice a dead link */ }
       return this;
     }
@@ -562,6 +566,37 @@
       e.preventDefault();
       window.openwiiExit();
     });
+
+    // Safari only unlocks Web Audio after a tap *inside this frame*, so a game
+    // started from a phone remote is silent until someone touches the iPad.
+    // Track the game's audio contexts, resume them on the first touch, and show
+    // a small hint while any of them is still locked.
+    const audioContexts = [];
+    for (const name of ['AudioContext', 'webkitAudioContext']) {
+      const Native = window[name];
+      if (!Native) continue;
+      window[name] = class extends Native {
+        constructor(...args) { super(...args); audioContexts.push(this); }
+      };
+    }
+    const unlockAudio = () => { for (const c of audioContexts) { try { c.resume(); } catch { /* ignore */ } } };
+    for (const ev of ['pointerdown', 'touchend', 'keydown']) window.addEventListener(ev, unlockAudio, { passive: true });
+    let hint = null;
+    window.setInterval(() => {
+      const locked = audioContexts.some((c) => c.state !== 'running');
+      if (!document.body) return;
+      if (locked && !hint) {
+        hint = document.createElement('div');
+        hint.textContent = '🔊 Tap the iPad screen once to turn on sound';
+        hint.style.cssText = 'position:fixed;left:50%;bottom:10px;transform:translateX(-50%);z-index:2147483000;'
+          + 'padding:5px 14px;border-radius:14px;background:rgba(20,28,40,.7);color:#fff;pointer-events:none;'
+          + 'font:600 13px -apple-system,system-ui,sans-serif;';
+        document.body.appendChild(hint);
+      } else if (!locked && hint) {
+        hint.remove();
+        hint = null;
+      }
+    }, 700);
   }
 
   window.io = function io() {
