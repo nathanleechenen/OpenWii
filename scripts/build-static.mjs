@@ -121,7 +121,11 @@ patch('menu.js', [
     'window.OpenWii.pairing().then(({ qr }) => {'],
   // Launch the game in an iframe on top of the launcher so the phone links survive.
   ['window.location.href = launching.tile.game.url;',
-    'window.OpenWii.open(launching.tile.game.url, () => {\n'
+    '// Free the launcher\'s big GPU buffer while the game runs (iPad graphics memory is tight).\n'
+    + '      renderer.setPixelRatio(0.1); renderer.setSize(2, 2, false);\n'
+    + '      window.OpenWii.open(launching.tile.game.url, () => {\n'
+    + '        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));\n'
+    + '        resize();\n'
     + "        const b = document.getElementById('launch'); if (b) b.remove();\n"
     + '        for (const o of tiles) o.mesh.material.opacity = 1;\n'
     + '        barMesh.material.opacity = 1;\n'
@@ -129,6 +133,8 @@ patch('menu.js', [
     + '        launching = null;\n'
     + '        try { audio.startMusic(); } catch (e) { /* audio still locked */ }\n'
     + '      });'],
+  // A rotation or resize while a game is open must not re-grow the hidden menu's buffer.
+  ['function resize() {', 'function resize() {\n  if (window.OpenWii && window.OpenWii.gameOpen) return;'],
   // Do not render the menu underneath a running game.
   ['function frame(now) {\n  requestAnimationFrame(frame);',
     'function frame(now) {\n  requestAnimationFrame(frame);\n  if (window.OpenWii && window.OpenWii.gameOpen) return;'],
@@ -147,6 +153,25 @@ patch('games/mario-kart/game.js', [
 // Mario Kart multiplayer (stage 1): extra phones drive their own karts.
 // The logic lives in games/mario-kart/multiplayer.js; these are only the hooks.
 patch('games/mario-kart/game.js', [
+  // If iPadOS reclaims the graphics context, restart the game page instead of leaving a dead screen.
+  ['renderer.setSize(innerWidth, innerHeight);\nrenderer.shadowMap.enabled = true;',
+    'renderer.setSize(innerWidth, innerHeight);\n'
+    + "renderer.domElement.addEventListener('webglcontextlost', (e) => {\n"
+    + '  e.preventDefault();\n'
+    + "  const n = Number(sessionStorage.getItem('openwii.glreload') || 0);\n"
+    + "  if (n < 2) { sessionStorage.setItem('openwii.glreload', String(n + 1)); setTimeout(() => location.reload(), 400); }\n"
+    + '});\n'
+    + "setTimeout(() => sessionStorage.removeItem('openwii.glreload'), 60000);\n"
+    + 'renderer.shadowMap.enabled = true;'],
+  // Lighter rendering so an iPad keeps its frame rate (and stays cool) over a whole race:
+  // lower resolution, 2x instead of 4x anti-aliasing, and no ambient-occlusion pass.
+  ['renderer.setPixelRatio(Math.min(devicePixelRatio, 1.6));', 'renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25));'],
+  ['  type: THREE.HalfFloatType,\n  samples: 4,', '  type: THREE.HalfFloatType,\n  samples: 2,'],
+  ['composer.addPass(ambientOcclusion);', 'ambientOcclusion.enabled = false;\ncomposer.addPass(ambientOcclusion);'],
+  // iPad Safari keeps audio locked until the iPad itself is touched, so awaiting the
+  // start sound froze the race on "LOADING…" when starting from a phone remote.
+  ["await audio.ui('start');",
+    "if (audio.engine.ctx && audio.engine.ctx.state === 'running') await audio.ui('start'); else Promise.resolve(audio.unlock()).catch(() => {});"],
   ['import { WheelInput } from "./input.js";',
     'import { WheelInput } from "./input.js";\nimport { MultiRace, RemotePlayers } from "./multiplayer.js";'],
   ['keys = new Set();', 'keys = new Set(),\n  remotes = new RemotePlayers();'],
