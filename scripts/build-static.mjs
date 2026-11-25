@@ -150,19 +150,20 @@ patch('games/mario-kart/game.js', [
   ["()=>location.href='/',100", "()=>(window.openwiiExit?window.openwiiExit():location.href='/'),100"],
 ]);
 
-// Mario Kart multiplayer (stage 1): extra phones drive their own karts.
-// The logic lives in games/mario-kart/multiplayer.js; these are only the hooks.
+// Mario Kart: stability/performance fixes, then multiplayer hooks (up to 4 phones,
+// per-player drivers, player count, split-screen). The logic lives in
+// games/mario-kart/multiplayer.js; these patches only wire it into game.js.
 patch('games/mario-kart/game.js', [
   // If iPadOS reclaims the graphics context, restart the game page instead of leaving a dead screen.
   ['renderer.setSize(innerWidth, innerHeight);\nrenderer.shadowMap.enabled = true;',
-    'renderer.setSize(innerWidth, innerHeight);\n'
-    + "renderer.domElement.addEventListener('webglcontextlost', (e) => {\n"
-    + '  e.preventDefault();\n'
-    + "  const n = Number(sessionStorage.getItem('openwii.glreload') || 0);\n"
-    + "  if (n < 2) { sessionStorage.setItem('openwii.glreload', String(n + 1)); setTimeout(() => location.reload(), 400); }\n"
-    + '});\n'
-    + "setTimeout(() => sessionStorage.removeItem('openwii.glreload'), 60000);\n"
-    + 'renderer.shadowMap.enabled = true;'],
+    `renderer.setSize(innerWidth, innerHeight);
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  const n = Number(sessionStorage.getItem('openwii.glreload') || 0);
+  if (n < 2) { sessionStorage.setItem('openwii.glreload', String(n + 1)); setTimeout(() => location.reload(), 400); }
+});
+setTimeout(() => sessionStorage.removeItem('openwii.glreload'), 60000);
+renderer.shadowMap.enabled = true;`],
   // Lighter rendering so an iPad keeps its frame rate (and stays cool) over a whole race:
   // lower resolution, 2x instead of 4x anti-aliasing, and no ambient-occlusion pass.
   ['renderer.setPixelRatio(Math.min(devicePixelRatio, 1.6));', 'renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25));'],
@@ -172,14 +173,23 @@ patch('games/mario-kart/game.js', [
   // start sound froze the race on "LOADING…" when starting from a phone remote.
   ["await audio.ui('start');",
     "if (audio.engine.ctx && audio.engine.ctx.state === 'running') await audio.ui('start'); else Promise.resolve(audio.unlock()).catch(() => {});"],
+
+  // ── multiplayer: setup, input and menus ──
   ['import { WheelInput } from "./input.js";',
-    'import { WheelInput } from "./input.js";\nimport { MultiRace, RemotePlayers } from "./multiplayer.js";'],
-  ['keys = new Set();', 'keys = new Set(),\n  remotes = new RemotePlayers();'],
+    'import { WheelInput } from "./input.js";\nimport { MultiRace, RemotePlayers, SplitHud, view, camStore, layoutViews } from "./multiplayer.js";'],
+  ['keys = new Set();',
+    `keys = new Set(),
+  remotes = new RemotePlayers(CHARACTERS.map((c) => c.id)),
+  splitHud = new SplitHud();
+remotes.p1Id = selected;
+remotes.onChange = () => { if (race?.state === "ready" && !starting) constructRace(); };`],
   ['race = new Race({\n    character: selected,', 'race = new MultiRace({\n    character: selected,'],
+  ['resultsShown = false;resultsPresentation=null;',
+    'remotes.p1Id = selected;\n  remotes.setup(race);\n  camStore.length = 0;\n  resultsShown = false;resultsPresentation=null;'],
   ['onOrientation: (sample, slot) => {\n    if (slot !== 0) return;',
     'onOrientation: (sample, slot) => {\n    if (slot !== 0) { remotes.sample(sample, slot, performance.now(), race?.state); return; }'],
   ['onCommand: (cmd, slot) => {\n    if (slot !== 0) return;',
-    'onCommand: (cmd, slot) => {\n    if (slot !== 0) { remotes.command(cmd, slot, performance.now()); return; }'],
+    'onCommand: (cmd, slot) => {\n    if (slot !== 0) { remotes.command(cmd, slot, performance.now(), race?.state); return; }'],
   ['onPresence: (p) => {', 'onPresence: (p) => {\n    remotes.presence(p);'],
   ['? "PHONE CONNECTED · P1"', '? remotes.label(p)'],
   ['function sendProfile() {\n  link.feedback({ type: "controller-profile", profile: "wheel", slot: 0 });',
@@ -187,16 +197,118 @@ patch('games/mario-kart/game.js', [
     + '  for (const s of remotes.slots()) link.feedback({ type: "controller-profile", profile: "wheel", slot: s });'],
   ["if(e.racer===0)link.feedback({type:'rumble',pattern:[35],slot:0});",
     "if(e.racer===0)link.feedback({type:'rumble',pattern:[35],slot:0});"
-    + "else if(remotes.has(e.racer))link.feedback({type:'rumble',pattern:[35],slot:e.racer});"],
+    + "else if(remotes.slotForRacer(e.racer)>0)link.feedback({type:'rumble',pattern:[35],slot:remotes.slotForRacer(e.racer)});"],
   ['link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: 0 });',
     'link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: 0 });\n'
-    + '    if (e.racer > 0 && remotes.has(e.racer)) link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: e.racer });'],
+    + '    if (remotes.slotForRacer(e.racer) > 0) link.feedback({ type: "rumble", pattern: [80, 40, 80], slot: remotes.slotForRacer(e.racer) });'],
+  // Driver menu: P1 cannot land on a driver another phone holds; up/down sets the player count.
+  ['const c=CHARACTERS[(index+CHARACTERS.length)%CHARACTERS.length];',
+    'const c=CHARACTERS[(index+CHARACTERS.length)%CHARACTERS.length];\n  if (remotes.occupied(0).has(c.id) && c.id !== selected) return;'],
+  ['chooseDriver(index+step);', 'chooseDriver(remotes.skipPicked(index, step));'],
+  ["if (direction === 'left' || direction === 'right') selectLaps(selectedLaps === 1 ? 3 : 1);",
+    "if (direction === 'left' || direction === 'right') selectLaps(selectedLaps === 1 ? 3 : 1);\n"
+    + "    else if (direction === 'up' || direction === 'down') remotes.bumpCount(direction === 'up' ? 1 : -1);"],
+  ["{setDriverConfirmed(true);audio.ui('confirm');}\n    else begin();",
+    "{setDriverConfirmed(true);audio.ui('confirm');}\n"
+    + "    else if (remotes.allReady()) begin();\n"
+    + "    else { $('menu-hint').textContent = remotes.hint(); audio.ui('cancel'); }"],
   ['wheel.reset();\n  captureUntil = performance.now() + 3000;\n  race.start();',
     'wheel.reset();\n  remotes.reset(performance.now());\n  captureUntil = performance.now() + 3000;\n  race.start();'],
   ['if (!(usingPhone && race.state === "countdown" && !wheel.armed))\n      race.update(dt, input);',
     'remotes.apply(race);\n    if (!(usingPhone && race.state === "countdown" && !(wheel.armed && remotes.allArmed())))\n      race.update(dt, input, remotes.read(now));'],
   ["const waiting=usingPhone && race.state==='countdown' && !wheel.armed;",
     "const waiting=usingPhone && race.state==='countdown' && !(wheel.armed && remotes.allArmed());"],
+
+  // ── split-screen: draw() becomes drawView(), run once per human racer ──
+  ['function draw(dt, now) {\n  const p = race.player,',
+    'function drawView(camDt, now) {\n  // Only the first view advances animations/particles; the others just re-aim and re-render.\n  const dt = view.pass === 0 ? camDt : 0;\n  const p = race.player,'],
+  ['const cast = i === 0 || Math.hypot(r.x - p.x, r.z - p.z) < 18;',
+    'const cast = i === 0 || view.count > 1 || Math.hypot(r.x - p.x, r.z - p.z) < 18;'],
+  ['boostFeedback=updateBoostScreen(race.time,p.boost);',
+    'if (view.pass === 0) boostFeedback=updateBoostScreen(race.time,p.boost);'],
+  ['cameraUp.lerp(up, 1 - Math.exp(-dt * 7)).normalize();', 'cameraUp.lerp(up, 1 - Math.exp(-camDt * 7)).normalize();'],
+  ['unconstrainedEye.lerp(camTarget, 1 - Math.exp(-dt * 13));', 'unconstrainedEye.lerp(camTarget, 1 - Math.exp(-camDt * 13));'],
+  ['cameraAim.lerp(cameraAimTarget, 1 - Math.exp(-dt * 13));', 'cameraAim.lerp(cameraAimTarget, 1 - Math.exp(-camDt * 13));'],
+  ['upperHeadFocus,avoidScenery,sceneryOffset,dt));', 'upperHeadFocus,avoidScenery,sceneryOffset,camDt));'],
+  ['(1 - Math.exp(-dt * 6));', '(1 - Math.exp(-camDt * 6));'],
+  ['const headFocus = driverCameraAnchor(karts[0].model,cameraFocus);',
+    'const headFocus = driverCameraAnchor(karts[p.id].model,cameraFocus);'],
+  ['const upperHeadFocus = driverCameraAnchor(karts[0].model,cameraFocus,true);',
+    'const upperHeadFocus = driverCameraAnchor(karts[p.id].model,cameraFocus,true);'],
+  ['if (finishBlend > 0) camera.setViewOffset(', 'if (finishBlend > 0 && !view.rect) camera.setViewOffset('],
+  ['camera.updateProjectionMatrix();\n  key.position.set(',
+    'camera.aspect = view.rect ? view.rect.w / view.rect.h : innerWidth / innerHeight;\n  camera.updateProjectionMatrix();\n  key.position.set('],
+  ['key.position.set(p.x - 30, p.y + 60, p.z + 25);', 'if (view.pass === 0) key.position.set(p.x - 30, p.y + 60, p.z + 25);'],
+  ['key.target.position.set(p.x, p.y, p.z);\n  key.target.updateMatrixWorld();',
+    'if (view.pass === 0) { key.target.position.set(p.x, p.y, p.z); key.target.updateMatrixWorld(); }'],
+  ['composer.render();', 'renderView();'],
+  ['if (previousDrawTime && !document.hidden) {', 'if (view.pass === 0 && previousDrawTime && !document.hidden) {'],
+  ['previousDrawTime = now;\n  updateHUD();', 'previousDrawTime = now;\n  if (view.pass === 0) updateHUD();'],
+  ['function updateHUD() {',
+    `function camSave(i) {
+  camStore[i] = { init: initializedCamera, lf: lastFlightCamera, lc: landingCamera,
+    up: cameraUp.clone(), eye: unconstrainedEye.clone(), aim: cameraAim.clone(),
+    target: camTarget.clone(), aimTarget: cameraAimTarget.clone(), offset: sceneryOffset.clone(), fov: camera.fov };
+}
+function camLoad(i) {
+  const s = camStore[i];
+  if (!s) { initializedCamera = false; lastFlightCamera = landingCamera = null; return; }
+  initializedCamera = s.init; lastFlightCamera = s.lf; landingCamera = s.lc;
+  cameraUp.copy(s.up); unconstrainedEye.copy(s.eye); cameraAim.copy(s.aim);
+  camTarget.copy(s.target); cameraAimTarget.copy(s.aimTarget); sceneryOffset.copy(s.offset); camera.fov = s.fov;
+}
+function renderView() {
+  const r = view.rect;
+  if (!r) { composer.render(); return; }
+  // Split-screen: render straight to the canvas inside this player's rectangle
+  // (no bloom / ambient occlusion, so four views stay affordable on an iPad).
+  const y = innerHeight - r.y - r.h;
+  renderer.setScissorTest(true);
+  renderer.setViewport(r.x, y, r.w, r.h);
+  renderer.setScissor(r.x, y, r.w, r.h);
+  renderer.render(scene, camera);
+}
+// One pass per human racer (P1 first). With a single human this is exactly the old draw().
+function draw(dt, now) {
+  const all = race.state === 'ready' ? null : remotes.viewsFor(race);
+  const views = all && all.length > 1 ? all : null;
+  document.body.classList.toggle('split', !!views);
+  if (!views) {
+    if (view.count !== 1) {
+      view.count = 1;
+      renderer.setScissorTest(false);
+      renderer.shadowMap.autoUpdate = true;
+      renderer.setViewport(0, 0, innerWidth, innerHeight);
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      splitHud.update(null);
+    }
+    view.pass = 0; view.rect = null;
+    drawView(dt, now);
+    return;
+  }
+  const rects = layoutViews(views.length, innerWidth, innerHeight);
+  if (!camStore[0]) camSave(0);
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, innerWidth, innerHeight);
+  renderer.clear();
+  // The shadow map follows P1's light; render it once per frame, not once per view.
+  renderer.shadowMap.autoUpdate = false;
+  renderer.shadowMap.needsUpdate = true;
+  view.count = views.length;
+  for (let i = 0; i < views.length; i++) {
+    race.player = race.racers[views[i].racer];
+    view.pass = i; view.rect = rects[i];
+    camLoad(i);
+    drawView(dt, now);
+    camSave(i);
+  }
+  race.player = race.racers[0];
+  camLoad(0);
+  view.pass = 0; view.rect = null;
+  splitHud.update(race, views, rects);
+}
+function updateHUD() {`],
 ]);
 
 // ── Report ──────────────────────────────────────────────────────────────────
