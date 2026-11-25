@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bowling — OpenWii</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; cursor: none;
+    background: #120d1f; color: #f4efff;
+    font: 500 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    user-select: none;
+  }
+  canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  #hud { position: absolute; inset: 0; pointer-events: none; }
+  #card, #total { z-index: 6; }          /* stay readable above the overlay */
+  #card {
+    position: absolute; left: 50%; top: 18px; transform: translateX(-50%);
+    display: flex; gap: 4px; padding: 8px; border-radius: 14px;
+    background: #1b1430d9; border: 1px solid #4a3a7a; box-shadow: 0 6px 20px #0008;
+  }
+  .fr { width: 62px; border-radius: 8px; background: #2a2048; border: 1px solid #4a3a7a; overflow: hidden; }
+  .fr.last { width: 90px; }
+  .fr.cur { border-color: #ffd75e; box-shadow: 0 0 0 2px #ffd75e66; }
+  .fr .n { font-size: 10px; text-align: center; color: #9d8fcf; background: #221a3d; }
+  .fr .m { display: flex; justify-content: flex-end; border-bottom: 1px solid #4a3a7a; height: 22px; }
+  .fr .m span { flex: 0 0 22px; text-align: center; font-weight: 800; font-size: 14px;
+                line-height: 22px; border-left: 1px solid #4a3a7a; }
+  .fr .m span:first-child { border-left: 0; }
+  .fr .t { text-align: center; font-size: 18px; font-weight: 800; line-height: 28px; }
+  #total { position: absolute; left: 50%; top: 104px; transform: translateX(-50%);
+           font-size: 13px; color: #b9acea; letter-spacing: .08em; text-transform: uppercase; }
+  #total b { color: #fff; font-size: 16px; }
+
+  #banner {
+    position: absolute; left: 50%; top: 34%; transform: translate(-50%, -50%) scale(.6);
+    font-size: 76px; font-weight: 900; letter-spacing: -0.02em; opacity: 0; white-space: nowrap;
+    background: linear-gradient(120deg, #ffd75e, #ff6b6b); -webkit-background-clip: text;
+    background-clip: text; color: transparent; filter: drop-shadow(0 6px 18px #0009);
+    transition: opacity .25s, transform .25s;
+  }
+  #banner.on { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  #readout {
+    position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%);
+    font-size: 20px; font-weight: 700; color: #e9e2ff; text-shadow: 0 2px 8px #000a;
+    white-space: nowrap;
+  }
+  #keys { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+          font-size: 11px; color: #9d8fcf; white-space: nowrap; }
+  #keys a { color: inherit; pointer-events: auto; }
+  #link { position: absolute; right: 30px; bottom: 24px; display: flex; align-items: center;
+          gap: 9px; font-size: 13px; color: #d8cffc; background: #1b1430d0;
+          border: 1px solid #4a3a7a; padding: 9px 14px; border-radius: 999px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b5d9a; }
+  .dot.on { background: #2fe08b; }
+  #debug { position: absolute; right: 30px; top: 66px; margin: 0; display: none;
+           background: #1b1430e6; border: 1px solid #4a3a7a; border-radius: 12px;
+           padding: 13px 15px; font: 12px/1.6 ui-monospace, Menlo, monospace;
+           color: #d8cffc; white-space: pre; }
+  #debug.on { display: block; }
+
+  #overlay { position: absolute; inset: 0; display: grid; place-items: center; z-index: 5;
+             background: radial-gradient(ellipse at 50% 40%, #2b1f55ee, #120d1ff5 75%); }
+  #overlay.hide { display: none; }
+  .panel { text-align: center; max-width: 600px; padding: 0 30px; }
+  .panel h1 { font-size: 54px; margin: 0 0 8px; font-weight: 800; letter-spacing: -0.03em; }
+  .panel h1 em { font-style: normal;
+    background: linear-gradient(120deg, #ffd75e, #ff6b6b);
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .panel p { color: #c9bdf5; margin: 0 auto 22px; max-width: 480px; }
+  .steps { display: flex; justify-content: center; gap: 12px; margin: 0 0 24px; }
+  .step { background: #ffffff12; border: 1px solid #4a3a7a; border-radius: 14px; padding: 12px 14px;
+          width: 150px; font-size: 13px; color: #d8cffc; }
+  .step b { display: block; font-size: 22px; }
+  .stat { display: inline-block; margin: 0 10px 20px; }
+  .stat b { display: block; font-size: 34px; }
+  .stat span { font-size: 12px; color: #b9acea; text-transform: uppercase; letter-spacing: .1em; }
+  .cta { font-size: 14px; color: #c9bdf5; }
+  .cta strong { color: #fff; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud">
+  <div id="card"></div>
+  <div id="total">Total <b id="total-n">0</b></div>
+  <div id="banner"></div>
+  <div id="readout"></div>
+  <div id="keys"><a href="/">← Games</a> · slide the remote sideways to line up · swing it <b>up</b> to bowl ·
+    lean the swing to steer · mouse: click throws · <b>I</b> flips swing direction · <b>D</b> debug</div>
+  <div id="link"><span class="dot" id="dot"></span><span id="link-t">no remote connected</span></div>
+  <pre id="debug"></pre>
+</div>
+
+<div id="overlay">
+  <div class="panel" id="panel">
+    <h1>🎳 <em>Bowling</em></h1>
+    <p>Ten frames. Hold the remote like a bowling ball and throw it.</p>
+    <div class="steps">
+      <div class="step"><b>↔</b>Slide it sideways to line up on the foul line</div>
+      <div class="step"><b>⤴</b>Swing it forward and up to release</div>
+      <div class="step"><b>💨</b>Harder swing, faster ball. Lean the swing to steer</div>
+    </div>
+    <div class="cta"><strong>A</strong> or <strong>Space</strong> to start · <strong>B</strong> menu</div>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script type="module" src="game.js"></script>
+</body>
+</html>
