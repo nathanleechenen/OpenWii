@@ -16,6 +16,7 @@
  * Optional env var: SKIP_SOURCE_GLB=1 leaves out the *-source.glb model files.
  */
 import fs from 'node:fs';
+import { execSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,7 +30,7 @@ let fileCount = 0;
 function fail(msg) { console.error(`\nBUILD FAILED: ${msg}\n`); process.exit(1); }
 
 function shouldSkipFile(name, full, size) {
-  if (/\.test\.mjs$/.test(name) || name.endsWith('.md')) return true;
+  if (/\.test\.mjs$/.test(name) || name.endsWith('.md') || name.endsWith('.zip')) return true;
   if (process.env.SKIP_SOURCE_GLB === '1' && name.endsWith('-source.glb')) return true;
   if (size > PAGES_FILE_LIMIT) { skippedBig.push(`${path.relative(ROOT, full)} (${(size / 1048576).toFixed(1)} MB)`); return true; }
   return false;
@@ -84,6 +85,75 @@ const shimDir = path.join(DIST, 'socket.io');
 fs.mkdirSync(shimDir, { recursive: true });
 fs.copyFileSync(path.join(ROOT, 'web', 'socket-shim.js'), path.join(shimDir, 'socket.io.js'));
 
+// ── 3b. LibreCorsa (optional): clone the fork, build it as a static site, bridge the phone ──
+// Any failure here only skips the LibreCorsa tile; the rest of OpenWii still deploys.
+// Env: SKIP_LIBRECORSA=1 to skip, LIBRECORSA_REPO to point at a different fork.
+function buildLibreCorsa() {
+  if (process.env.SKIP_LIBRECORSA === '1') { console.log('LibreCorsa: skipped (SKIP_LIBRECORSA=1)'); return null; }
+  const repo = process.env.LIBRECORSA_REPO || 'https://github.com/shashasha29/librecorsa.git';
+  const work = path.join(ROOT, '.cache', 'librecorsa');
+  const target = path.join(DIST, 'games', 'librecorsa');
+  const run = (cmd, cwd, env = {}) => execSync(cmd, { cwd, stdio: 'inherit', env: { ...process.env, ...env } });
+  try {
+    fs.rmSync(work, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(work), { recursive: true });
+    console.log(`LibreCorsa: cloning ${repo}`);
+    run(`git clone --depth 1 ${repo} ${JSON.stringify(work)}`, ROOT);
+    run('npm ci --ignore-scripts --no-audit --no-fund', work);
+    console.log('LibreCorsa: building (next build)…');
+    run('npx next build', work, {
+      NEXT_PUBLIC_BASE_PATH: '/games/librecorsa',
+      NEXT_PUBLIC_SITE_URL: process.env.URL || 'https://openwii.netlify.app',
+      NODE_OPTIONS: '--max-old-space-size=4096',
+      NEXT_TELEMETRY_DISABLED: '1',
+    });
+    const out = path.join(work, 'out');
+    if (!fs.existsSync(path.join(out, 'play.html')) && !fs.existsSync(path.join(out, 'play', 'index.html'))) {
+      throw new Error('the build produced no play page in out/');
+    }
+    copyTree(out, target);
+
+    // Put the phone→gamepad bridge in front of the game's own scripts on every page.
+    fs.copyFileSync(path.join(ROOT, 'web', 'librecorsa-pad.js'), path.join(target, 'openwii-pad.js'));
+    const tag = '<script src="/socket.io/socket.io.js"></script><script src="/games/librecorsa/openwii-pad.js"></script>';
+    let injected = 0;
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.name.endsWith('.html')) {
+          const html = fs.readFileSync(full, 'utf8');
+          if (/<head[^>]*>/i.test(html)) {
+            fs.writeFileSync(full, html.replace(/<head[^>]*>/i, (m) => m + tag));
+            injected += 1;
+          }
+        }
+      }
+    };
+    walk(target);
+    if (!injected) throw new Error('could not inject the phone bridge (no <head> found)');
+
+    // AGPL-3.0-or-later: tell visitors where the source of this served copy lives.
+    fs.writeFileSync(path.join(target, 'SOURCE.txt'), [
+      'This directory serves LibreCorsa (https://github.com/KhazP/librecorsa), licensed AGPL-3.0-or-later.',
+      `Source of the copy served here: ${repo.replace(/\.git$/, '')}`,
+      'The OpenWii phone-controller bridge (openwii-pad.js) is part of the OpenWii fork that serves this site.',
+      'Car and track models and audio have their own non-commercial licenses: see LibreCorsa CREDITS.md.',
+      '',
+    ].join('\n'));
+
+    // Next exports routes as play.html; serve /games/librecorsa/play without the extension.
+    fs.appendFileSync(path.join(DIST, '_redirects'), '/games/librecorsa/play  /games/librecorsa/play.html  200\n');
+    console.log(`LibreCorsa: ready (${injected} pages bridged)`);
+    return { slug: 'librecorsa', url: '/games/librecorsa/play', title: 'LibreCorsa', tagline: 'F1 sim · phone is the wheel', emoji: '🏎️', order: 6 };
+  } catch (err) {
+    console.warn(`\nLibreCorsa: skipped — ${err && err.message ? err.message : err}\n`);
+    fs.rmSync(target, { recursive: true, force: true });
+    return null;
+  }
+}
+const libreCorsa = buildLibreCorsa();
+
 // ── 4. Replacement for the server's game-discovery and session APIs ─────────
 const gamesRoot = path.join(ROOT, 'games');
 // Faithful port of listGames() in server.js: game.json is optional, `hidden`
@@ -99,6 +169,10 @@ const games = fs.readdirSync(gamesRoot, { withFileTypes: true })
   })
   .filter((g) => !g.hidden)
   .sort((a, b) => (a.order ?? 99) - (b.order ?? 99) || a.title.localeCompare(b.title));
+if (libreCorsa) {
+  games.push(libreCorsa);
+  games.sort((a, b) => (a.order ?? 99) - (b.order ?? 99) || a.title.localeCompare(b.title));
+}
 const apiDir = path.join(DIST, 'api');
 fs.mkdirSync(apiDir, { recursive: true });
 fs.writeFileSync(path.join(apiDir, 'games'), JSON.stringify(games));
