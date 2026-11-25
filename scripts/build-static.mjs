@@ -123,9 +123,12 @@ patch('menu.js', [
   ['window.location.href = launching.tile.game.url;',
     '// Free the launcher\'s big GPU buffer while the game runs (iPad graphics memory is tight).\n'
     + '      renderer.setPixelRatio(0.1); renderer.setSize(2, 2, false);\n'
+    + '      try { renderer.forceContextLoss(); } catch (e) { /* not supported: buffer is already shrunk */ }\n'
     + '      window.OpenWii.open(launching.tile.game.url, () => {\n'
+    + '        try { renderer.forceContextRestore(); } catch (e) { /* ignore */ }\n'
     + '        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));\n'
     + '        resize();\n'
+    + '        setTimeout(() => { try { if (renderer.getContext().isContextLost()) location.reload(); } catch (e) { location.reload(); } }, 1500);\n'
     + "        const b = document.getElementById('launch'); if (b) b.remove();\n"
     + '        for (const o of tiles) o.mesh.material.opacity = 1;\n'
     + '        barMesh.material.opacity = 1;\n'
@@ -168,7 +171,10 @@ renderer.shadowMap.enabled = true;`],
   // lower resolution, 2x instead of 4x anti-aliasing, and no ambient-occlusion pass.
   ['renderer.setPixelRatio(Math.min(devicePixelRatio, 1.6));', 'renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25));'],
   ['  type: THREE.HalfFloatType,\n  samples: 4,', '  type: THREE.HalfFloatType,\n  samples: 2,'],
-  ['composer.addPass(ambientOcclusion);', 'ambientOcclusion.enabled = false;\ncomposer.addPass(ambientOcclusion);'],
+  ['const ambientOcclusion = new GTAOPass(scene, camera, innerWidth, innerHeight);',
+    'const ambientOcclusion = new GTAOPass(scene, camera, 64, 64);'],
+  // The AO pass is never added: its full-size render targets would otherwise sit in iPad GPU memory unused.
+  ['composer.addPass(ambientOcclusion);', '// (ambient-occlusion pass left out to save GPU memory)'],
   // iPad Safari keeps audio locked until the iPad itself is touched, so awaiting the
   // start sound froze the race on "LOADING…" when starting from a phone remote.
   ["await audio.ui('start');",
