@@ -118,12 +118,19 @@
     const buttons = Array.from({ length: BUTTON_COUNT }, () => ({ pressed: false, touched: false, value: 0 }));
     const set = (i, value) => { buttons[i] = { pressed: value > 0.5, touched: value > 0, value }; };
     const held = state.buttons || {};
-    for (const [name, index] of Object.entries(MAP)) if (held[name]) set(index, 1);
-    const brake = state.brakeValue !== undefined ? state.brakeValue : state.brake ? 1 : 0;
-    const gas = state.gasValue !== undefined ? state.gasValue : state.gas ? 1 : 0;
-    if (brake > 0) set(LT, Math.min(1, brake));
-    if (gas > 0) set(RT, Math.min(1, gas));
-    const steer = Math.max(-1, Math.min(1, Number(state.steer) || 0));
+    let steer = 0;
+    if (state.menu) {
+      // In menus the phone is a pointer: nothing steers or presses a pedal (the left stick would move the menu focus).
+      // Only short "pulses" (B = back) reach the game as gamepad buttons; A clicks at the cursor instead.
+      for (const [index, until] of Object.entries(state.pulses || {})) if (until > now) set(Number(index), 1);
+    } else {
+      for (const [name, index] of Object.entries(MAP)) if (held[name]) set(index, 1);
+      const brake = state.brakeValue !== undefined ? state.brakeValue : state.brake ? 1 : 0;
+      const gas = state.gasValue !== undefined ? state.gasValue : state.gas ? 1 : 0;
+      if (brake > 0) set(LT, Math.min(1, brake));
+      if (gas > 0) set(RT, Math.min(1, gas));
+      steer = Math.max(-1, Math.min(1, Number(state.steer) || 0));
+    }
     return {
       id: PAD_ID,
       index: 0,
@@ -144,7 +151,7 @@
 
   if (typeof window.io !== 'function' || !navigator) return;   // opened outside OpenWii: leave the game alone
 
-  const state = { present: false, steer: 0, gas: false, brake: false, gasValue: 0, brakeValue: 0, buttons: {} };
+  const state = { present: false, menu: false, pulses: {}, steer: 0, gas: false, brake: false, gasValue: 0, brakeValue: 0, buttons: {} };
   const pedals = { gas: 0, brake: 0, ref: null, cal: null };
   const upright = new UprightWheel();
   let wheel = null;
@@ -176,6 +183,7 @@
   const realGetGamepads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads.bind(navigator) : () => [];
   function refresh() {
     const now = performance.now();
+    if (state.menu) { state.steer = 0; state.gas = false; state.brake = false; state.gasValue = 0; state.brakeValue = 0; state.buttons = {}; return now; }
     if (!wheel) { state.steer = 0; state.gas = false; state.brake = false; state.gasValue = 0; state.brakeValue = 0; state.buttons = {}; return now; }
     const r = wheel.read(now);
     const uprightOn = upright.armed && !wheel.armed;       // which way the phone was held when it was levelled
@@ -214,13 +222,132 @@
     if (present && !state.present) captureUntil = performance.now() + 4000;   // first level, shortly after connecting
     state.present = present;
     announce(present);
+    if (present) {
+      sendProfile();                                    // pointer layout in menus, wheel layout when driving
+      if (state.menu && pointer) pointer.recentre();
+    }
     if (present) toast('Hold the phone like a wheel (or flat like a tray), then press − to recentre · forward = gas, back = brake');
   });
 
-  // The phone only shows its steering-wheel layout while a game keeps asking for it.
-  setInterval(() => {
-    if (state.present) link.emit('feedback', { type: 'controller-profile', profile: 'wheel', slot: 0 });
-  }, 850);
+  // The phone shows its steering-wheel layout only while a game keeps asking for it; in menus it needs the pointer layout.
+  function sendProfile() {
+    if (state.present) link.emit('feedback', { type: 'controller-profile', profile: state.menu ? 'default' : 'wheel', slot: 0 });
+  }
+  setInterval(sendProfile, 850);
+
+  // ── Menus: the phone is a pointer (aim = cursor, A = click, B = back) until the race starts ──
+  const CLICKABLE = 'button, a[href], [role="button"], [role="radio"], [role="checkbox"], [role="tab"], '
+    + '[role="switch"], [role="option"], [role="menuitem"], input, select, label, summary';
+  let pointer = null;
+  let lastPointerAt = 0;
+  (window.__owLoad || ((u) => import(u)))('/core/pointer.js').then((m) => {
+    pointer = new m.Pointer({});
+    pointer.setViewport(window.innerWidth || 1, window.innerHeight || 1);
+  }).catch((err) => console.warn('[openwii] pointer unavailable', err));
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', () => { if (pointer) pointer.setViewport(window.innerWidth, window.innerHeight); });
+  }
+
+  /** True while any LibreCorsa menu (title, setup, pause, settings…) is on screen: they all use focus zones. */
+  function menuOpen() {
+    try { return !!document.querySelector('[data-nav-zone]'); } catch (e) { return false; }
+  }
+
+  function targetAt(x, y) {
+    try {
+      const el = document.elementFromPoint(x, y);
+      return el && el.closest ? el.closest(CLICKABLE) : null;
+    } catch (e) { return null; }
+  }
+
+  function clickAt(x, y) {
+    const t = targetAt(x, y);
+    if (!t) return false;
+    if (t.tagName === 'INPUT' && t.type === 'range') {                  // sliders: set the value from where the cursor is
+      const r = t.getBoundingClientRect();
+      const min = Number(t.min || 0), max = Number(t.max || 100), step = Number(t.step || 1);
+      const ratio = Math.max(0, Math.min(1, (x - r.left) / Math.max(1, r.width)));
+      const value = Math.round((min + ratio * (max - min)) / step) * step;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      if (setter && setter.set) setter.set.call(t, String(value)); else t.value = String(value);
+      t.dispatchEvent(new Event('input', { bubbles: true }));
+      t.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, view: window };
+    const po = { ...o, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    t.dispatchEvent(new PointerEvent('pointerdown', po));
+    t.dispatchEvent(new MouseEvent('mousedown', o));
+    t.dispatchEvent(new PointerEvent('pointerup', po));
+    t.dispatchEvent(new MouseEvent('mouseup', o));
+    t.click();
+    return true;
+  }
+
+  let cursorEl = null;
+  let hiliteEl = null;
+  function ensureCursor() {
+    if (cursorEl || !document.body) return !!cursorEl;
+    cursorEl = document.createElement('div');
+    cursorEl.innerHTML = '<svg width="34" height="34" viewBox="0 0 34 34"><path d="M4 2 L4 26 L10 20.5 L14.5 30 L19 28 L14.6 18.6 L22.5 18.4 Z" '
+      + 'fill="#fff" stroke="#10151f" stroke-width="2.2" stroke-linejoin="round"/></svg>';
+    cursorEl.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483001;pointer-events:none;display:none;'
+      + 'filter:drop-shadow(0 2px 3px rgba(0,0,0,.55));will-change:transform;';
+    hiliteEl = document.createElement('div');
+    hiliteEl.style.cssText = 'position:fixed;z-index:2147483000;pointer-events:none;display:none;border:2px solid #ffd331;'
+      + 'border-radius:8px;box-shadow:0 0 0 2px rgba(0,0,0,.35),0 0 14px rgba(255,211,49,.6);';
+    document.body.appendChild(hiliteEl);
+    document.body.appendChild(cursorEl);
+    return true;
+  }
+
+  function hideCursor() {
+    if (cursorEl) cursorEl.style.display = 'none';
+    if (hiliteEl) hiliteEl.style.display = 'none';
+  }
+
+  function updateCursor(now) {
+    const show = state.present && state.menu && pointer && pointer.live && now - pointer.lastSeen < 700;
+    if (!show || !ensureCursor()) { hideCursor(); return; }
+    const a = pointer.sampleAt(now);
+    const x = a.x * window.innerWidth, y = a.y * window.innerHeight;
+    cursorEl.style.display = 'block';
+    cursorEl.style.transform = 'translate(' + (x - 4) + 'px,' + (y - 2) + 'px)';
+    const t = targetAt(x, y);
+    if (t) {
+      const r = t.getBoundingClientRect();
+      Object.assign(hiliteEl.style, { display: 'block', left: r.left - 3 + 'px', top: r.top - 3 + 'px', width: r.width + 6 + 'px', height: r.height + 6 + 'px' });
+    } else hiliteEl.style.display = 'none';
+  }
+
+  function setMenu(open, now) {
+    if (open === state.menu) return;
+    state.menu = open;
+    state.pulses = {};
+    if (open) {
+      if (pointer) pointer.recentre();                  // start from the middle of the screen
+    } else {
+      // The race is starting: drop the pointer and re-learn the driving pose from however the phone is held now.
+      hideCursor();
+      if (wheel) wheel.reset();
+      upright.reset();
+      pedals.ref = null; pedals.cal = null; pedals.gas = 0; pedals.brake = 0;
+      toast('Hold the phone like a wheel (or flat like a tray) and keep it still to set neutral');
+    }
+    sendProfile();
+  }
+
+  /** One step of the menu watcher + cursor; runs every animation frame (and is callable for tests). */
+  function tick() {
+    const now = performance.now();
+    setMenu(menuOpen(), now);
+    updateCursor(now);
+  }
+  window.openwiiPad = { tick };
+  if (typeof window.requestAnimationFrame === 'function') {
+    const loop = () => { tick(); window.requestAnimationFrame(loop); };
+    window.requestAnimationFrame(loop);
+  }
 
   // ── Phone input → the shared WheelInput from Mario Kart (same tilt maths and level calibration) ──
   (window.__owLoad || ((u) => import(u)))('/games/mario-kart/input.js').then((m) => { wheel = new m.WheelInput(); }).catch((err) => {
@@ -228,8 +355,14 @@
   });
 
   link.on('orientation', (s) => {
-    if (!wheel || !s || s.slot !== 0) return;
+    if (!s || s.slot !== 0) return;
     const now = performance.now();
+    if (pointer) {
+      const dt = lastPointerAt ? Math.min(0.1, Math.max(1 / 240, (now - lastPointerAt) / 1000)) : 1 / 60;
+      lastPointerAt = now;
+      pointer.update(s, dt, now);
+    }
+    if (!wheel || state.menu) return;                  // menus only need the pointer; the wheel learns when driving starts
     const learning = (!wheel.armed && !upright.armed) || now < captureUntil;
     wheel.sample(s, now, { canCapture: learning && !upright.armed });   // flat (tray) pose
     upright.sample(wheel.lastAxes, now, learning && !wheel.armed);        // upright (wheel) pose
@@ -252,8 +385,21 @@
   link.on('command', (c) => {
     if (!c || c.slot !== 0) return;
     if (c.type === 'home') { if (window.openwiiExit) window.openwiiExit(); return; }
+    const t0 = performance.now();
+    if (state.menu) {                                   // pointer menus
+      if (c.type === 'button' && c.button === 'A' && c.pressed !== false) {
+        if (pointer && pointer.live) { const a = pointer.sampleAt(t0); clickAt(a.x * window.innerWidth, a.y * window.innerHeight); }
+      } else if (c.type === 'button' && c.button === 'B' && c.pressed !== false) {
+        state.pulses[1] = t0 + 160;                      // gamepad B = back / cancel
+      } else if (c.type === 'recentre' || c.type === 'calibrate') {
+        if (pointer) pointer.recentre();
+      } else if (c.type === 'speed' && pointer) {
+        pointer.sensitivity = Math.max(0.2, Math.min(6, pointer.sensitivity * (c.factor || 1)));
+      }
+      return;
+    }
     if (!wheel) return;
-    const now = performance.now();
+    const now = t0;
     wheel.command(c, now);
     if (c.type === 'recentre' || c.type === 'calibrate') { wheel.reset(); upright.reset(); captureUntil = now + 10000; }
   });
