@@ -217,6 +217,25 @@ patch('menu.js', [
     'function frame(now) {\n  requestAnimationFrame(frame);\n  if (window.OpenWii && window.OpenWii.gameOpen) return;'],
 ]);
 
+// Phone controller: a long press on a button must never select its label or open the iOS callout.
+patch('controller.html', [
+  ['</head>', `<style>
+  html, body, button, .dp, .pill, .num { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  button, .dp, .pill, .num { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>`],
+  ['</body>', `<script>
+(function () {
+  // iOS selects text / shows a callout on long press; these stop that everywhere except the diagnostics box.
+  var inDiag = function (e) { return e.target && e.target.closest && e.target.closest('#diag'); };
+  document.addEventListener('contextmenu', function (e) { if (!inDiag(e)) e.preventDefault(); });
+  document.addEventListener('selectstart', function (e) { if (!inDiag(e)) e.preventDefault(); });
+  document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+})();
+</script>
+</body>`],
+]);
+
 patch('core/splash.js', [
   ["setTimeout(() => { window.location.href = '/'; }, 950);",
     "setTimeout(() => { if (window.openwiiExit) window.openwiiExit(); else window.location.href = '/'; }, 950);"],
