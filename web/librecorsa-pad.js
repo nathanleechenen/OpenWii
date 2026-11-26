@@ -40,7 +40,7 @@
   // ── Tilt pedals: pitch relative to the level the wheel was calibrated at ──
   const DEG = Math.PI / 180;
   const PEDAL_DEADZONE = 3;    // degrees of tilt ignored (hand tremor, resting angle)
-  const PEDAL_FULL = 18;       // degrees of tilt for a fully pressed pedal
+  const PEDAL_FULL = 35;       // degrees of tilt for a fully pressed pedal
   const clamp1 = (v) => Math.max(-1, Math.min(1, v));
   const shapePedal = (deg) => (deg <= PEDAL_DEADZONE ? 0 : Math.min(1, (deg - PEDAL_DEADZONE) / (PEDAL_FULL - PEDAL_DEADZONE)));
 
