@@ -31,6 +31,7 @@
   const HB_MS = 2000;          // heartbeat period, both directions
   const DEAD_MS = 7000;        // silence longer than this = connection is dead
   const ROOM_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const QR_CORNERS = ['top-right', 'top-left', 'bottom-left'];
 
   // Public STUN servers plus a free public TURN relay as a last resort, for
   // networks where phones and iPad cannot reach each other directly.
@@ -224,8 +225,11 @@
       this.onExit = null;
       this.unavailableTries = 0;
       this.label = null;
+      this.qrCard = null;            // always-visible pairing card (kept out of the bottom-right corner)
+      this.qrData = '';
       this.gameOpen = false;
 
+      this.pairing().then((p) => { this.qrData = p.qr || ''; this._updateLabel(); });
       window.addEventListener('message', (e) => this._onFrameMessage(e));
       window.setInterval(() => this._tick(), HB_MS);
       this._open();
@@ -373,6 +377,59 @@
       for (const c of this.core.ctrls) if (c.registered) n += 1;
       this.label.style.display = this.gameOpen ? 'none' : 'block';
       this.label.textContent = `Room ${this.room} · ${n} remote${n === 1 ? '' : 's'} · ${this.status}`;
+      this._updateQr(n);
+    }
+
+    // -- pairing card: big until a phone joins, then a small corner QR for anyone else. Tap it to move it. --
+    _updateQr(remotes) {
+      if (!this.qrData || !document.body) return;
+      if (!this.qrCard) {
+        const card = document.createElement('div');
+        card.style.cssText = 'position:fixed;z-index:6;padding:8px 8px 5px;border-radius:14px;background:rgba(255,255,255,.96);'
+          + 'box-shadow:0 4px 18px rgba(0,0,0,.35);text-align:center;cursor:pointer;user-select:none;-webkit-user-select:none;'
+          + '-webkit-touch-callout:none;font:700 12px/1.3 -apple-system,system-ui,sans-serif;color:#1d2a3d;';
+        card.title = 'Tap to move';
+        const img = document.createElement('img');
+        img.src = this.qrData;
+        img.alt = 'QR code: scan with a phone to join';
+        img.draggable = false;
+        img.style.cssText = 'display:block;image-rendering:pixelated;margin:0 auto 3px;';
+        const cap = document.createElement('div');
+        card.appendChild(img);
+        card.appendChild(cap);
+        card.addEventListener('click', () => this._moveQr());
+        document.body.appendChild(card);
+        this.qrCard = { card, img, cap };
+        this._placeQr();
+      }
+      const { card, img, cap } = this.qrCard;
+      card.style.display = this.gameOpen ? 'none' : 'block';
+      const size = remotes > 0 ? 92 : 150;
+      img.style.width = `${size}px`;
+      img.style.height = `${size}px`;
+      cap.textContent = remotes > 0 ? `Room ${this.room}` : `Scan to join · ${this.room}`;
+    }
+
+    // Bottom-right is left out on purpose: Netlify's free-plan badge sits there.
+    _qrCorner() {
+      const c = store.get('openwii.qrcorner');
+      return QR_CORNERS.indexOf(c) === -1 ? QR_CORNERS[0] : c;
+    }
+
+    _placeQr() {
+      if (!this.qrCard) return;
+      const st = this.qrCard.card.style;
+      st.top = st.right = st.bottom = st.left = 'auto';
+      const c = this._qrCorner();
+      if (c === 'top-right') { st.top = '10px'; st.right = '10px'; }
+      else if (c === 'top-left') { st.top = '10px'; st.left = '10px'; }
+      else { st.bottom = '34px'; st.left = '8px'; }      // bottom-left, just above the status pill
+    }
+
+    _moveQr() {
+      const next = QR_CORNERS[(QR_CORNERS.indexOf(this._qrCorner()) + 1) % QR_CORNERS.length];
+      store.set('openwii.qrcorner', next);
+      this._placeQr();
     }
   }
 
